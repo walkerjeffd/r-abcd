@@ -1,0 +1,8 @@
+Package: abcd
+Title: The abcd water balance model
+Version: 0.1
+Authors@R: "Jeffrey Walker <jeff@walkerjeff.com> [aut, cre]"
+Description: Develop and run the abcd water balance model
+Depends: R (>= 3.1.1)
+License: MIT
+LazyData: true
