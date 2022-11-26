@@ -1,0 +1,270 @@
+---
+title: "ABCD Model"
+author: "Jeffrey D Walker, PhD"
+date: "November 2, 2014"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+theme_set(theme_bw())
+library(weathergen)
+library(tidyr)
+library(gridExtra)
+```
+
+# Configuration
+
+```{r}
+basin_area_mi2 <- 94 # mi2
+basin_area_km2 <- basin_area_mi2*(1.60934)^2
+latitude <- 42.2
+longitude <- -72.9375
+```
+
+
+# Load Inflow Data
+
+```{r}
+inflow <- read.table('westfield_inflows.txt', stringsAsFactors=FALSE, header=TRUE) %>%
+  mutate(Date=mdy(Date)) %>%
+  dplyr::select(DATE=Date, INFLOW)
+ggplot(inflow, aes(DATE, INFLOW)) +
+  geom_line() +
+  labs(x='', y='Daily Flow (cfs)')
+```
+
+Convert inflow from cfs to hm3/month
+
+```{r}
+inflow <- mutate(inflow, 
+                 DATE=floor_date(DATE, unit='month'),
+                 INFLOW=INFLOW*(1/3.28084)^3*(1/100)^3*86400) %>%
+  group_by(DATE) %>%
+  summarise(INFLOW=sum(INFLOW))
+ggplot(inflow, aes(DATE, INFLOW)) +
+  geom_line() +
+  labs(x='', y='Monthly Flow (hm3/mon)')
+```
+
+Convert inflow from hm3/month to mm/month
+
+```{r}
+inflow <- mutate(inflow,
+                 INFLOW=INFLOW/basin_area_km2*1000)
+ggplot(inflow, aes(DATE, INFLOW)) +
+  geom_line() +
+  labs(x='', y='Monthly Flow Rate (mm/mon)')
+```
+
+# Load Climate Data
+
+```{r}
+library(weathergen)
+clim <- get_maurer_mon(latitude, longitude) %>%
+  filter(YEAR <= 2009)
+```
+
+```{r}
+select(clim, DATE, PRCP, TAVG) %>%
+  gather(VAR, VALUE, PRCP:TAVG) %>%
+  ggplot(aes(DATE, VALUE)) +
+  geom_line() +
+  facet_wrap(~VAR, ncol=1, scales='free_y')
+```
+
+## Compute PET
+
+```{r}
+nday <- days_in_month(clim$DATE)
+jday <- yday(clim$DATE) + nday/2 - 1 # julian day at middle of month
+Tavg <- (clim$TMIN+clim$TMAX)/2
+Tdif <- (clim$TMAX-clim$TMIN)/2
+
+phi <- pi/180*latitude
+
+dr <- (1+0.033*cos(2*pi/365*jday))
+delta <- 0.409*sin((2*pi/365*jday)-1.39)
+ws <- acos(-tan(phi)*tan(delta))
+Rs <- ((24*60/pi)*0.082*dr*(ws*sin(phi)*sin(delta)+cos(phi)*cos(delta)*sin(ws)))*0.408
+clim$PET <- 0.0023*Rs*(Tavg+17.8)*sqrt(Tdif)*nday # mm/mon
+```
+
+The mean PET is `r format(mean((group_by(clim, YEAR) %>% summarise(PET=sum(PET)))$PET), digits=4)` mm/yr
+
+```{r}
+group_by(clim, YEAR) %>%
+  summarise(PET=sum(PET)) %>%
+  ggplot(aes(YEAR, PET)) + geom_line()
+```
+
+# ABCD Model
+
+```{r}
+param <- c(a=0.98, b=500, c=0.5, d=0.5, e=0.5, Tm=0)
+init <- c(S=350, G=0.5, A=0)
+
+abcdSimulate <- function(param, input, init) {
+  names(param) <- c('a', 'b', 'c', 'd', 'e', 'Tm') 
+  n_step <- nrow(inflow)
+  variables <- c('P','PET','T','A','mt','Pe','PETe','W','Y','S','E','G','Q')
+  
+  
+  x <- array(data=NA,
+             dim=c(n_step+1, length(variables)),
+             dimnames=list(TIMESTEP=seq(0, n_step),
+                           VARIABLE=variables))
+  x[1, names(init)] <- init
+  x[2:(n_step+1), 'T'] <- input$TAVG
+  x[2:(n_step+1), 'P'] <- input$PRCP
+  x[2:(n_step+1), 'PET'] <- input$PET
+  
+  for (i in 2:(n_step+1)) {
+    if (x[i, 'T'] > param['Tm']) {
+      x[i, 'mt'] <- min(param['e']*(x[i, 'T']-param['Tm'])*x[i-1, 'A'], x[i-1, 'A'])
+      x[i, 'Pe'] <- x[i, 'P'] + x[i, 'mt']
+      x[i, 'PETe'] <- x[i, 'PET']
+      x[i, 'A'] <- x[i-1, 'A'] - x[i, 'mt']
+    } else {
+      x[i, 'mt'] <- 0
+      x[i, 'Pe'] <- 0
+      x[i, 'PETe'] <- 0
+      x[i, 'A'] <- x[i-1, 'A'] + x[i, 'P']
+    }
+  
+    x[i, 'W'] <- x[i, 'Pe'] + x[i-1, 'S']
+    
+    w1 <- (x[i, 'W']+param['b'])/(2*param['a'])
+    w2 <- x[i, 'W']*param['b']/param['a']
+    x[i, 'Y'] <- w1 - sqrt((w1^2)-w2)
+    x[i, 'S'] <- x[i, 'Y']*exp(-x[i, 'PETe']/param['b'])
+    x[i, 'E'] <- x[i, 'Y']*(1-exp(-x[i, 'PETe']/param['b']))
+    x[i, 'G'] <- (x[i-1, 'G'] + param['c']*round((x[i, 'W']-x[i, 'Y']),2))/(1+param['d'])
+    x[i, 'Q'] <- (1-param['c'])*round((x[i, 'W']-x[i, 'Y']),2)+param['d']*x[i, 'G']
+  }
+  return(x)
+}
+Qsim <- abcdSimulate(param=param, input=select(clim, TAVG, PRCP, PET), init=init)[, 'Q']
+Qsim <- Qsim[2:length(Qsim)]
+```
+
+```{r}
+err <- data.frame(DATE=inflow$DATE,
+                  Qobs=inflow$INFLOW,
+                  Qsim=Qsim) %>%
+  mutate(Qres=Qobs-Qsim,
+         Qres2=Qres^2)
+RMSE <- sqrt(mean(err$Qres2))
+NSE <- 1-sum(err$Qres2)/sum((err$Qobs-mean(err$Qobs))^2)
+```
+
+
+```{r}
+select(err, DATE, Qobs, Qsim) %>%
+  gather(VAR, VALUE, Qobs:Qsim) %>%
+  ggplot(aes(DATE, VALUE, color=VAR)) +
+  geom_line()
+```
+
+```{r}
+err %>%
+  ggplot(aes(Qsim, Qobs)) +
+  geom_point() +
+  geom_abline()
+```
+
+# Calibration
+
+```{r}
+abcdFit <- function(param, input, init, Qobs) {
+  x <- abcdSimulate(param=param, input=input, init=init)
+  Qsim <- x[2:dim(x)[1], 'Q']
+  sum((Qobs-Qsim)^2)
+#   sum((log(Qobs)-log(Qsim))^2)
+}
+abcdFit(param, input=select(clim, TAVG, PRCP, PET), init=init, Qobs=inflow$INFLOW)
+```
+
+
+```{r}
+library(hydromad)
+param_init <- c(0.98,500,0.5,0.5,0.5,5)
+param_lower <- c(.9,50,0,0,0,-10)
+param_upper <- c(.99999,950,1,1,1,10)
+result <- SCEoptim(abcdFit,
+                   param_init,
+                   input=select(clim, TAVG, PRCP, PET), 
+                   init=init, 
+                   Qobs=inflow$INFLOW,
+                   lower=param_lower,
+                   upper=param_upper,
+                   control=list(trace=2))
+```
+
+
+```{r}
+x <- abcdSimulate(param=result$par, input=select(clim, TAVG, PRCP, PET), init=init)
+Qsim <- x[2:dim(x)[1],'Q']
+
+err <- data.frame(DATE=inflow$DATE,
+                  Qobs=inflow$INFLOW,
+                  Qsim=Qsim) %>%
+  mutate(Qres=Qobs-Qsim,
+         Qres2=Qres^2)
+RMSE <- sqrt(mean(err$Qres2))
+NSE <- 1-sum(err$Qres2)/sum((err$Qobs-mean(err$Qobs))^2)
+```
+
+```{r}
+p1 <- select(err, DATE, Qobs, Qsim) %>%
+  gather(VAR, VALUE, Qobs:Qsim) %>%
+  ggplot(aes(DATE, value, color=variable)) +
+  geom_line()
+
+p2 <- p1 +
+  scale_y_log10()
+
+grid.arrange(p1, p2, ncol=1)
+```
+
+```{r}
+err %>%
+  ggplot(aes(Qsim, Qobs)) +
+  geom_point() +
+  geom_abline()
+```
+
+```{r}
+err %>%
+  ggplot(aes(Qsim, Qobs)) +
+  geom_point() +
+  geom_abline() +
+  scale_y_log10() +
+  scale_x_log10()
+```
+
+```{r}
+select(err, DATE, Qobs, Qsim) %>%
+  gather(VAR, VALUE, Qobs:Qsim) %>%
+  group_by(variable) %>%
+  mutate(freq=1-row_number(value)/n()) %>%
+  ggplot(aes(freq, log10(value), color=variable)) +
+  geom_line()
+```
+
+# Export to Web App
+
+```{r, eval=FALSE}
+df <- data.frame(Date=seq(min(clim$DATE), max(clim$DATE)+months(1)-days(1), by='1 day')) %>%
+  mutate(MonthYear=floor_date(Date, unit='month')) %>%
+  left_join(select(clim, MonthYear=DATE, Precip_mm=PRCP, Tmin_degC=TMIN, Tmax_degC=TMAX)) %>%
+  mutate(Precip_in=Precip_mm/25.4/days_in_month(MonthYear)) %>%
+  left_join(select(inflow, MonthYear=DATE, Flow_mm=INFLOW)) %>%
+  mutate(Flow_in=Flow_mm/25.4/days_in_month(MonthYear)) %>%
+  select(-Precip_mm, -Flow_mm, -MonthYear)
+write.csv(df, 'wetfield.csv', row.names=FALSE)
+```
+
+
